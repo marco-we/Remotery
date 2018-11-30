@@ -44,6 +44,7 @@
     @D3D11:         Direct3D 11 event sampling
     @OPENGL:        OpenGL event sampling
     @METAL:         Metal event sampling
+    @VULKAN:        Vulkan event sampling
 */
 
 #define RMT_IMPL
@@ -150,7 +151,9 @@ static rmtBool g_SettingsInitialized = RMT_FALSE;
     #include <cuda.h>
 #endif
 
-
+#if RMT_USE_VULKAN
+    #include <vulkan.h>
+#endif
 
 static rmtU8 minU8(rmtU8 a, rmtU8 b)
 {
@@ -3856,6 +3859,7 @@ enum SampleType
     SampleType_D3D11,
     SampleType_OpenGL,
     SampleType_Metal,
+    SampleType_Vulkan,
     SampleType_Count,
 };
 
@@ -4399,6 +4403,12 @@ static rmtError Metal_Create(Metal** metal);
 static void Metal_Destructor(Metal* metal);
 #endif
 
+#if RMT_USE_VULKAN
+typedef struct Vulkan_t Vulkan;
+static rmtError Vulkan_Create(Vulkan** vulkan);
+static void Vulkan_Destructor(Vulkan* vulkan);
+#endif
+
 
 struct Remotery
 {
@@ -4432,6 +4442,10 @@ struct Remotery
 
 #if RMT_USE_METAL
     Metal* metal;
+#endif
+
+#if RMT_USE_VULKAN
+	Vulkan* vulkan;
 #endif
 };
 
@@ -4543,6 +4557,8 @@ static rmtError bin_SampleTree(Buffer* buffer, Msg_SampleTree* msg)
         strncat_s(thread_name, sizeof(thread_name), " (OpenGL)", 9);
     if (root_sample->type == SampleType_Metal)
         strncat_s(thread_name, sizeof(thread_name), " (Metal)", 8);
+    if (root_sample->type == SampleType_Vulkan)
+        strncat_s(thread_name, sizeof(thread_name), " (Vulkan)", 9);
 
     // Get digest hash of samples so that viewer can efficiently rebuild its tables
     GetSampleDigest(root_sample, &digest_hash, &nb_samples);
@@ -4851,6 +4867,10 @@ static rmtError Remotery_Constructor(Remotery* rmt)
         rmt->metal = NULL;
     #endif
 
+    #if RMT_USE_VULKAN
+        rmt->vulkan = NULL;
+    #endif
+
     // Kick-off the timer
     usTimer_Init(&rmt->timer);
 
@@ -4891,6 +4911,11 @@ static rmtError Remotery_Constructor(Remotery* rmt)
             return error;
     #endif
 
+    #if RMT_USE_VULKAN
+        error = Vulkan_Create(&rmt->vulkan);
+        if (error != RMT_ERROR_NONE)
+            return error;
+    #endif
 
     // Set as the global instance before creating any threads that uses it for sampling itself
     assert(g_Remotery == NULL);
@@ -4929,6 +4954,10 @@ static void Remotery_Destructor(Remotery* rmt)
 
     #if RMT_USE_METAL
         Delete(Metal, rmt->metal);
+    #endif
+
+    #if RMT_USE_VULKAN
+        Delete(Vulkan, rmt->vulkan);
     #endif
 
     Delete(rmtMessageQueue, rmt->mq_to_rmt_thread);
@@ -5313,7 +5342,7 @@ RMT_API void _rmt_EndCPUSample(void)
     }
 }
 
-#if RMT_USE_OPENGL || RMT_USE_D3D11
+#if RMT_USE_OPENGL || RMT_USE_D3D11 || RMT_USE_VULKAN
 static void Remotery_BlockingDeleteSampleTree(Remotery* rmt, enum SampleType sample_type)
 {
     ThreadSampler* ts;
@@ -7143,5 +7172,485 @@ RMT_API void _rmt_EndMetalSample(void)
 #endif  // RMT_USE_METAL
 
 
-#endif // RMT_ENABLED
 
+
+/*
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+   @VULKAN: Vulkan event sampling
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+*/
+
+
+#if RMT_USE_VULKAN
+
+// As clReflect has no way of disabling C++ compile mode, this forces C interfaces everywhere...
+#define CINTERFACE
+
+
+struct Vulkan_t
+{
+    // Context set by user
+    rmtVulkanBind bind;
+
+    VkQueryPool queryPool;
+    uint8_t slotStates[RMT_VULKAN_NUM_QUERY_POOL_SLOTS];
+
+    HRESULT last_error;
+
+    // Queue to the Vulkan main update thread
+    // Given that BeginSample/EndSample need to be called from the same thread that does the update, there
+    // is really no need for this to be a thread-safe queue. I'm using it for its convenience.
+    rmtMessageQueue* mq_to_vulkan_main;
+};
+
+
+static rmtError Vulkan_Create(Vulkan** vulkan)
+{
+    rmtError error;
+
+    assert(vulkan != NULL);
+
+    // Allocate space for the D3D11 data
+    *vulkan = (Vulkan*)rmtMalloc(sizeof(Vulkan));
+    if (*vulkan == NULL)
+        return RMT_ERROR_MALLOC_FAIL;
+
+    // Set defaults
+    (*vulkan)->bind.device = VK_NULL_HANDLE;
+    (*vulkan)->bind.cmdWriteTimestamp = NULL;
+    (*vulkan)->bind.createQueryPool = NULL;
+    (*vulkan)->bind.destroyQueryPool = NULL;
+    (*vulkan)->bind.getQueryPoolResults = NULL;
+    (*vulkan)->bind.resetQueryPool = NULL;
+    (*vulkan)->bind.createCommandPool = NULL;
+    (*vulkan)->bind.destroyCommandPool = NULL;
+    (*vulkan)->bind.allocateCommandBuffers = NULL;
+    (*vulkan)->bind.resetCommandBuffer = NULL;
+    (*vulkan)->bind.beginCommandBuffer = NULL;
+    (*vulkan)->bind.endCommandBuffer = NULL;
+    (*vulkan)->bind.timestampPeriod = 0.0f;
+    (*vulkan)->queryPool = VK_NULL_HANDLE;
+    (*vulkan)->last_error = S_OK;
+    (*vulkan)->mq_to_vulkan_main = NULL;
+
+    memset((*vulkan)->slotStates, 0, sizeof(uint8_t) * RMT_VULKAN_NUM_QUERY_POOL_SLOTS);
+
+    New_1(rmtMessageQueue, (*vulkan)->mq_to_vulkan_main, g_Settings.messageQueueSizeInBytes);
+    if (error != RMT_ERROR_NONE)
+    {
+        Delete(Vulkan, *vulkan);
+        return error;
+    }
+
+    return RMT_ERROR_NONE;
+}
+
+
+static void Vulkan_Destructor(Vulkan* vulkan)
+{
+    assert(vulkan != NULL);
+    Delete(rmtMessageQueue, vulkan->mq_to_vulkan_main);
+}
+
+typedef struct VulkanTimestamp
+{
+    // Inherit so that timestamps can be quickly allocated
+    ObjectLink Link;
+
+    // Pair of timestamp queries that wrap the sample
+    uint32_t query_start;
+    uint32_t query_end;
+
+    VkCommandBuffer commandBuffer;
+
+    rmtU64 cpu_timestamp;
+} VulkanTimestamp;
+
+
+static rmtError VulkanTimestamp_Constructor(VulkanTimestamp* stamp)
+{
+    assert(stamp != NULL);
+
+    ObjectLink_Constructor((ObjectLink*)stamp);
+
+    // Set defaults
+    stamp->query_start = 0;
+    stamp->query_end = 0;
+    stamp->cpu_timestamp = 0;
+    stamp->commandBuffer = VK_NULL_HANDLE;
+
+    // TODO-VOLK
+    // TODO Allocate slots for results
+
+    return RMT_ERROR_NONE;
+}
+
+
+static void VulkanTimestamp_Destructor(VulkanTimestamp* stamp)
+{
+    Vulkan* vulkan;
+
+    if (g_Remotery == NULL)
+        return;
+    vulkan = g_Remotery->vulkan;
+
+    assert(stamp != NULL);
+    assert(vulkan != NULL);
+}
+
+
+static void VulkanTimestamp_Begin(VulkanTimestamp* stamp, VkCommandBuffer commandBuffer)
+{
+    Vulkan* vulkan;
+    PFN_vkCmdWriteTimestamp writeTimestampFn;
+    uint32_t queryStartIdx;
+
+    if (g_Remotery == NULL)
+        return;
+    vulkan = g_Remotery->vulkan;
+
+    assert(vulkan != NULL);
+    assert(stamp != NULL);
+
+    // Start of disjoint and first query
+    stamp->cpu_timestamp = usTimer_Get(&g_Remotery->timer);
+    stamp->commandBuffer = commandBuffer;
+
+    for (queryStartIdx = 0; queryStartIdx < RMT_VULKAN_NUM_QUERY_POOL_SLOTS; ++queryStartIdx)
+        if (vulkan->slotStates[queryStartIdx] == 0)
+            break;
+
+    stamp->query_start = queryStartIdx;
+    stamp->query_end = queryStartIdx + 1;
+
+    vulkan->slotStates[queryStartIdx] = 1;
+    vulkan->slotStates[queryStartIdx + 1] = 1;
+
+    writeTimestampFn = (PFN_vkCmdWriteTimestamp)vulkan->bind.cmdWriteTimestamp;
+    writeTimestampFn(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, vulkan->queryPool, stamp->query_start);
+}
+
+
+static void VulkanTimestamp_End(VulkanTimestamp* stamp)
+{
+    Vulkan* vulkan;
+    PFN_vkCmdWriteTimestamp writeTimestampFn;
+
+    if (g_Remotery == NULL)
+        return;
+    vulkan = g_Remotery->vulkan;
+
+    assert(vulkan != NULL);
+    assert(stamp != NULL);
+
+    writeTimestampFn = (PFN_vkCmdWriteTimestamp)vulkan->bind.cmdWriteTimestamp;
+    writeTimestampFn(stamp->commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, vulkan->queryPool, stamp->query_end);
+}
+
+
+static HRESULT VulkanTimestamp_GetData(VulkanTimestamp* stamp, rmtU64* out_start, rmtU64* out_end, VkCommandBuffer commandBuffer)
+{
+    Vulkan* vulkan;
+    VkResult result;
+    PFN_vkGetQueryPoolResults getQueryPoolResultsFn;
+
+    assert(stamp != NULL);
+
+    if (g_Remotery == NULL)
+        return S_FALSE;
+    vulkan = g_Remotery->vulkan;
+
+    assert(vulkan != NULL);
+
+    uint32_t timestamps[2] = { 0 }; // 1 unit == "timestampPeriod" us
+    getQueryPoolResultsFn = (PFN_vkGetQueryPoolResults)vulkan->bind.getQueryPoolResults;
+    result = getQueryPoolResultsFn(vulkan->bind.device, vulkan->queryPool, stamp->query_start, 2, sizeof(timestamps), timestamps, sizeof(uint32_t), 0);
+
+    if (result == VK_SUCCESS)
+    {
+        PFN_vkCmdResetQueryPool resetQueryPoolFn;
+        const float timestampPeriod = vulkan->bind.timestampPeriod;
+
+        *out_start = (rmtU64)(timestamps[0] * timestampPeriod);
+        *out_end = (rmtU64)(timestamps[1] * timestampPeriod);
+
+        resetQueryPoolFn = (PFN_vkCmdResetQueryPool)vulkan->bind.resetQueryPool;
+        resetQueryPoolFn(commandBuffer, vulkan->queryPool, stamp->query_start, 2);
+
+        vulkan->slotStates[stamp->query_start] = 0;
+        vulkan->slotStates[stamp->query_end] = 0;
+
+        return S_OK;
+    }
+    if (result == VK_NOT_READY)
+    {
+        // TODO-VOLK Handle the cases where the results are not ready yet
+        *out_start = 0;
+        *out_end = 0;
+
+        return S_FALSE;
+    }
+    else
+    {
+        *out_start = 0;
+        *out_end = 0;
+
+        return S_FALSE;
+    }
+}
+
+typedef struct VulkanSample
+{
+    // IS-A inheritance relationship
+    Sample base;
+
+    VulkanTimestamp* timestamp;
+} VulkanSample;
+
+
+static rmtError VulkanSample_Constructor(VulkanSample* sample)
+{
+    rmtError error;
+
+    assert(sample != NULL);
+
+    // Chain to sample constructor
+    Sample_Constructor((Sample*)sample);
+    sample->base.type = SampleType_Vulkan;
+    sample->base.size_bytes = sizeof(VulkanSample);
+    New_0(VulkanTimestamp, sample->timestamp);
+
+    return RMT_ERROR_NONE;
+}
+
+
+static void VulkanSample_Destructor(VulkanSample* sample)
+{
+    Delete(VulkanTimestamp, sample->timestamp);
+    Sample_Destructor((Sample*)sample);
+}
+
+
+RMT_API void _rmt_BindVulkan(const rmtVulkanBind* bind)
+{
+    if (g_Remotery != NULL)
+    {
+        assert(g_Remotery->vulkan != NULL);
+
+        assert(bind->device != NULL);
+        assert(bind->cmdWriteTimestamp != NULL);
+        assert(bind->createQueryPool != NULL);
+        assert(bind->destroyQueryPool != NULL);
+        assert(bind->getQueryPoolResults != NULL);
+        assert(bind->resetQueryPool != NULL);
+        assert(bind->createCommandPool != NULL);
+        assert(bind->destroyCommandPool != NULL);
+        assert(bind->allocateCommandBuffers != NULL);
+        assert(bind->resetCommandBuffer != NULL);
+        assert(bind->beginCommandBuffer != NULL);
+        assert(bind->endCommandBuffer != NULL);
+        g_Remotery->vulkan->bind = *bind;
+
+        VkQueryPoolCreateInfo timestampQueryPoolCreateInfo = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        timestampQueryPoolCreateInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        timestampQueryPoolCreateInfo.queryCount = RMT_VULKAN_NUM_QUERY_POOL_SLOTS;
+
+        PFN_vkCreateQueryPool createQueryPoolFn = (PFN_vkCreateQueryPool)bind->createQueryPool;
+        createQueryPoolFn(bind->device, &timestampQueryPoolCreateInfo, NULL, &g_Remotery->vulkan->queryPool);
+    }
+}
+
+
+static void UpdateVulkanFrame(VkCommandBuffer commandBuffer);
+
+
+RMT_API void _rmt_UnbindVulkan(void)
+{
+    if (g_Remotery != NULL)
+    {
+        Vulkan* vulkan = g_Remotery->vulkan;
+        assert(vulkan != NULL);
+
+        // Stall waiting for the D3D queue to empty into the Remotery queue
+        while (!rmtMessageQueue_IsEmpty(vulkan->mq_to_vulkan_main))
+            UpdateVulkanFrame(VK_NULL_HANDLE);
+
+        // Inform sampler to not add any more samples
+        vulkan->bind.device = VK_NULL_HANDLE;
+        vulkan->bind.cmdWriteTimestamp = NULL;
+        vulkan->bind.timestampPeriod = 0.0f;
+
+        // Forcefully delete sample tree on this thread to release time stamps from
+        // the same thread that created them
+        Remotery_BlockingDeleteSampleTree(g_Remotery, SampleType_Vulkan);
+    }
+}
+
+
+RMT_API void _rmt_BeginVulkanSample(rmtPStr name, rmtU32* hash_cache, void* cmdBuffer)
+{
+    ThreadSampler* ts;
+    Vulkan* vulkan;
+    VkCommandBuffer commandBuffer = (VkCommandBuffer)cmdBuffer;
+
+    if (g_Remotery == NULL)
+        return;
+
+    // Has Vulkan been unbound?
+    vulkan = g_Remotery->vulkan;
+    assert(vulkan != NULL);
+
+    if (Remotery_GetThreadSampler(g_Remotery, &ts) == RMT_ERROR_NONE)
+    {
+        Sample* sample;
+        rmtU32 name_hash = ThreadSampler_GetNameHash(ts, name, hash_cache);
+
+        // Create the Vulkan tree on-demand as the tree needs an up-front-created root.
+        // This is not possible to create on initialisation as a Vulkan binding is not yet available.
+        SampleTree** vulkan_tree = &ts->sample_trees[SampleType_Vulkan];
+        if (*vulkan_tree == NULL)
+        {
+            rmtError error;
+            New_3(SampleTree, *vulkan_tree, sizeof(VulkanSample), (ObjConstructor)VulkanSample_Constructor, (ObjDestructor)VulkanSample_Destructor);
+            if (error != RMT_ERROR_NONE)
+                return;
+        }
+
+        // Push the sample and activate the timestamp
+        if (ThreadSampler_Push(*vulkan_tree, name_hash, 0, &sample) == RMT_ERROR_NONE)
+        {
+            VulkanSample* vulkan_sample = (VulkanSample*)sample;
+            VulkanTimestamp_Begin(vulkan_sample->timestamp, commandBuffer);
+        }
+    }
+}
+
+
+static rmtBool GetVulkanSampleTimes(Sample* sample, VkCommandBuffer commandBuffer)
+{
+    Sample* child;
+
+    VulkanSample* vulkan_sample = (VulkanSample*)sample;
+
+    assert(sample != NULL);
+    if (vulkan_sample->timestamp != NULL)
+    {
+        HRESULT result;
+
+        Vulkan* vulkan = g_Remotery->vulkan;
+        assert(vulkan != NULL);
+
+        result = VulkanTimestamp_GetData(
+            vulkan_sample->timestamp,
+            &sample->us_start,
+            &sample->us_end,
+            commandBuffer);
+
+        if (result != S_OK)
+        {
+            vulkan->last_error = result;
+            return RMT_FALSE;
+        }
+
+        sample->us_length = sample->us_end - sample->us_start;
+    }
+
+    // Get child sample times
+    for (child = sample->first_child; child != NULL; child = child->next_sibling)
+    {
+        if (!GetVulkanSampleTimes(child, commandBuffer))
+            return RMT_FALSE;
+    }
+
+    return RMT_TRUE;
+}
+
+
+static void UpdateVulkanFrame(VkCommandBuffer commandBuffer)
+{
+    Vulkan* vulkan;
+
+    if (g_Remotery == NULL)
+        return;
+
+    vulkan = g_Remotery->vulkan;
+    assert(vulkan != NULL);
+
+    rmt_BeginCPUSample(rmt_UpdateVulkanFrame, 0);
+
+    // Process all messages in the Vulkan queue
+    for (;;)
+    {
+        Msg_SampleTree* sample_tree;
+        Sample* sample;
+
+        Message* message = rmtMessageQueue_PeekNextMessage(vulkan->mq_to_vulkan_main);
+        if (message == NULL)
+            break;
+
+        // There's only one valid message type in this queue
+        assert(message->id == MsgID_SampleTree);
+        sample_tree = (Msg_SampleTree*)message->payload;
+        sample = sample_tree->root_sample;
+        assert(sample->type == SampleType_Vulkan);
+
+        // Retrieve timing of all Vulkan samples
+        // If they aren't ready leave the message unconsumed, holding up later frames and maintaining order
+        if (commandBuffer != VK_NULL_HANDLE)
+            if (!GetVulkanSampleTimes(sample, commandBuffer))
+                break;
+
+        // Pass samples onto the remotery thread for sending to the viewer
+        AddSampleTreeMessage(g_Remotery->mq_to_rmt_thread, sample, sample_tree->allocator, sample_tree->thread_name, message->thread_sampler);
+        rmtMessageQueue_ConsumeNextMessage(vulkan->mq_to_vulkan_main, message);
+    }
+
+    rmt_EndCPUSample();
+}
+
+
+RMT_API void _rmt_EndVulkanSample(void* cmdBuffer)
+{
+    ThreadSampler* ts;
+    Vulkan* vulkan;
+    VkCommandBuffer commandBuffer = (VkCommandBuffer)cmdBuffer;
+
+    if (g_Remotery == NULL)
+        return;
+
+    vulkan = g_Remotery->vulkan;
+    assert(vulkan != NULL);
+
+    if (Remotery_GetThreadSampler(g_Remotery, &ts) == RMT_ERROR_NONE)
+    {
+        // Close the timestamp
+        VulkanSample* vulkan_sample = (VulkanSample*)ts->sample_trees[SampleType_Vulkan]->current_parent;
+        if (vulkan_sample->base.recurse_depth > 0)
+        {
+            vulkan_sample->base.recurse_depth--;
+        }
+        else
+        {
+            if (vulkan_sample->timestamp != NULL)
+                VulkanTimestamp_End(vulkan_sample->timestamp);
+
+            // Send to the update loop for ready-polling
+            if (ThreadSampler_Pop(ts, vulkan->mq_to_vulkan_main, (Sample*)vulkan_sample))
+                // Perform ready-polling on popping of the root sample
+                UpdateVulkanFrame(commandBuffer);
+        }
+    }
+}
+
+RMT_API void _rmt_EndVulkanFrame(void* q)
+{
+    VkQueue queue = (VkQueue)q;
+
+    // TODO Create command
+}
+
+#endif  // RMT_USE_VULKAN
+
+#endif // RMT_ENABLED

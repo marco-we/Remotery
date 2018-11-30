@@ -77,6 +77,11 @@ documented just below this comment.
 #define RMT_USE_METAL 0
 #endif
 
+// Allow Vulkan profiling
+#ifndef RMT_USE_VULKAN
+#define RMT_USE_VULKAN 0
+#endif
+
 // Initially use POSIX thread names to name threads instead of Thread0, 1, ...
 #ifndef RMT_USE_POSIX_THREADNAMES
 #define RMT_USE_POSIX_THREADNAMES 0
@@ -105,6 +110,10 @@ documented just below this comment.
 #ifndef RMT_D3D11_RESYNC_ON_DISJOINT
 #define RMT_D3D11_RESYNC_ON_DISJOINT 1
 #endif
+
+
+
+#define RMT_VULKAN_NUM_QUERY_POOL_SLOTS 10000
 
 
 /*
@@ -172,6 +181,12 @@ documented just below this comment.
 #else
     #define IFDEF_RMT_USE_METAL(t, f) f
 #endif
+#if RMT_ENABLED && RMT_USE_VULKAN
+#define IFDEF_RMT_USE_VULKAN(t, f) t
+#else
+#define IFDEF_RMT_USE_VULKAN(t, f) f
+#endif
+
 
 
 // Public interface is written in terms of these macros to easily enable/disable itself
@@ -418,6 +433,24 @@ typedef struct rmtCUDABind
 
 } rmtCUDABind;
 
+// Structure to fill in when binding Vulkan to Remotery
+typedef struct rmtVulkanBind
+{
+    void* device;
+    void* cmdWriteTimestamp;
+    void* createQueryPool;
+    void* destroyQueryPool;
+    void* getQueryPoolResults;
+    void* resetQueryPool;
+    void* createCommandPool;
+    void* destroyCommandPool;
+    void* allocateCommandBuffers;
+    void* resetCommandBuffer;
+    void* beginCommandBuffer;
+    void* endCommandBuffer;
+    float timestampPeriod;
+
+} rmtVulkanBind;
 
 // Call once after you've initialised CUDA to bind it to Remotery
 #define rmt_BindCUDA(bind)                                                  \
@@ -491,6 +524,27 @@ typedef struct rmtCUDABind
 #define rmt_EndMetalSample()                                                \
     RMT_OPTIONAL(RMT_USE_METAL, _rmt_EndMetalSample())
 
+
+#define rmt_BindVulkan(bind)                                                 \
+    RMT_OPTIONAL(RMT_USE_VULKAN, _rmt_BindVulkan(bind))
+
+#define rmt_UnbindVulkan()                                                   \
+    RMT_OPTIONAL(RMT_USE_VULKAN, _rmt_UnbindVulkan())
+
+#define rmt_BeginVulkanSample(name)                                          \
+    RMT_OPTIONAL(RMT_USE_VULKAN, {                                           \
+        static rmtU32 rmt_sample_hash_##name = 0;                            \
+        _rmt_BeginVulkanSample(#name, &rmt_sample_hash_##name);              \
+    })
+
+#define rmt_BeginVulkanSampleDynamic(namestr, commandBuffer)                 \
+    RMT_OPTIONAL(RMT_USE_VULKAN, _rmt_BeginVulkanSample(namestr, NULL, commandBuffer))
+
+#define rmt_EndVulkanSample(commandBuffer)                                   \
+    RMT_OPTIONAL(RMT_USE_VULKAN, _rmt_EndVulkanSample(commandBuffer))
+
+#define rmt_EndVulkanFrame(queue)                                            \
+    RMT_OPTIONAL(RMT_USE_VULKAN, _rmt_EndVulkanFrame(queue))
 
 
 
@@ -639,6 +693,14 @@ RMT_API void _rmt_EndOpenGLSample(void);
 #if RMT_USE_METAL
 RMT_API void _rmt_BeginMetalSample(rmtPStr name, rmtU32* hash_cache);
 RMT_API void _rmt_EndMetalSample(void);
+#endif
+
+#if RMT_USE_VULKAN
+RMT_API void _rmt_BindVulkan(const rmtVulkanBind* bind);
+RMT_API void _rmt_UnbindVulkan(void);
+RMT_API void _rmt_BeginVulkanSample(rmtPStr name, rmtU32* hash_cache, void* commandBuffer);
+RMT_API void _rmt_EndVulkanSample(void* commandBuffer);
+RMT_API void _rmt_EndVulkanFrame(void* queue);
 #endif
 
 #ifdef __cplusplus
